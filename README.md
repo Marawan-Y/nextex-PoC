@@ -1,4 +1,4 @@
-# NexTex AI — Take-Home Assignment
+# NexTex AI — Proof of Concept
 
 **Anomaly-detection event pipeline: cloud queue/consumer service + Jetson edge simulator with live monitoring UI.**
 
