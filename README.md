@@ -1,209 +1,1354 @@
 # NexTex AI — Proof of Concept
 
-**Anomaly-detection event pipeline: cloud queue/consumer service + Jetson edge simulator with live monitoring UI.**
+An end-to-end textile anomaly-detection pipeline with a simulated Jetson edge device, live monitoring UI, Redis Streams, an independent cloud consumer, PostgreSQL persistence, and MQTT telemetry.
 
-Everything runs locally via `docker compose up` — no cloud infrastructure required.
+The project runs locally with Docker Compose. No cloud account, Node.js installation, Kaggle account, physical Jetson device, or external dataset is required for the default demo.
 
+---
+
+## Table of contents
+
+1. [Project overview](#project-overview)
+2. [Architecture](#architecture)
+3. [Services and URLs](#services-and-urls)
+4. [Quick start](#quick-start)
+5. [Approach A — Docker on Windows 11](#approach-a--docker-on-windows-11)
+6. [Running after the initial setup](#running-after-the-initial-setup)
+7. [Meeting and demo runbook](#meeting-and-demo-runbook)
+8. [Approach B — Manual setup in Ubuntu WSL](#approach-b--manual-setup-in-ubuntu-wsl)
+9. [Dataset options](#dataset-options)
+10. [Environment variables](#environment-variables)
+11. [Development workflow](#development-workflow)
+12. [Logs and diagnostics](#logs-and-diagnostics)
+13. [Stopping, resetting, and preserving data](#stopping-resetting-and-preserving-data)
+14. [Troubleshooting](#troubleshooting)
+15. [Repository structure](#repository-structure)
+16. [Design decisions](#design-decisions)
+17. [Production considerations](#production-considerations)
+
+---
+
+## Project overview
+
+NexTex AI contains two cooperating systems.
+
+| Area | Services | Responsibility |
+|---|---|---|
+| Cloud pipeline | `cloud-api`, `cloud-consumer`, `redis`, `postgres` | Validate events, queue them, persist them, and expose health and metrics |
+| Edge simulation | `edge-simulator`, `mosquitto` | Generate frames, run mocked detection, emit events, publish telemetry, and serve the monitoring UI |
+
+The Edge Simulator emits two event types:
+
+| Event | Trigger | Frame |
+|---|---|---|
+| `new_anomaly_class` | A defect class is observed for the first time or after its cooldown | Required |
+| `threshold_exceeded` | Defect confidence exceeds `ALARM_THRESHOLD` | Omitted by default |
+
+The default frame source is a deterministic synthetic textile generator. If real images exist under `edge_simulator/data/fabric_images/`, they are used automatically.
+
+---
+
+## Architecture
+
+![NexTex architecture](diagrams/architecture.png)
+
+```text
+Synthetic or real images
+          |
+          v
+Edge Simulator + Mock Detector
+          |
+          +---- WebSocket ----> Monitoring UI
+          |
+          +---- HTTP events --> Cloud API
+          |                        |
+          |                        v
+          |                  Redis Stream
+          |                        |
+          |                        v
+          |                  Cloud Consumer
+          |                        |
+          |                        v
+          |                    PostgreSQL
+          |
+          +---- MQTT telemetry --> Mosquitto
+          |
+          +---- local buffering for temporary network failure
 ```
+
+The Cloud API and Cloud Consumer are separate processes. The API can continue accepting events while persistence is temporarily slow. Redis consumer groups provide at-least-once delivery and stale-message recovery.
+
+---
+
+## Services and URLs
+
+| Service | Host port | Purpose |
+|---|---:|---|
+| `edge-simulator` | `8002` | Dashboard, camera WebSocket, edge statistics |
+| `cloud-api` | `8001` | Event ingestion, health, metrics, recent events |
+| `postgres` | `5432` | Durable event storage |
+| `redis` | `6379` | Redis Streams queue |
+| `mosquitto` | `1883` | MQTT telemetry broker |
+| `cloud-consumer` | none | Reads Redis and persists events |
+
+| Page or endpoint | URL |
+|---|---|
+| Monitoring dashboard | http://localhost:8002 |
+| Edge configuration | http://localhost:8002/config |
+| Edge statistics | http://localhost:8002/stats |
+| Swagger API documentation | http://localhost:8001/docs |
+| Cloud health | http://localhost:8001/health |
+| Cloud metrics | http://localhost:8001/metrics |
+| Recent persisted events | http://localhost:8001/events/recent?limit=20 |
+
+---
+
+## Quick start
+
+For a machine that has already completed the initial Docker setup:
+
+```powershell
+Set-Location "C:\path\to\nextex-PoC"
+
+docker compose up -d
+Start-Sleep -Seconds 10
+
+docker compose ps
+Invoke-RestMethod http://localhost:8001/health | ConvertTo-Json
+
+Start-Process "http://localhost:8002"
+Start-Process "http://localhost:8001/docs"
+Start-Process "http://localhost:8001/metrics"
+```
+
+Stop the project while preserving data:
+
+```powershell
+docker compose down
+```
+
+Use `docker compose up -d --build` only after code, Dockerfile, dependency, or Compose changes.
+
+---
+
+# Approach A — Docker on Windows 11
+
+This is the recommended and most reproducible approach.
+
+Docker provides PostgreSQL, Redis, Mosquitto, Python 3.12, all Python dependencies, and all application processes.
+
+## A1. Prerequisites
+
+Required:
+
+- Windows 11 64-bit
+- Hardware virtualization enabled
+- WSL 2
+- Ubuntu under WSL
+- Docker Desktop using the WSL 2 backend
+- Git
+- A modern browser
+
+Not required:
+
+- Node.js or npm
+- Local PostgreSQL, Redis, or Mosquitto installations
+- Kaggle credentials
+- A cloud account
+- A physical Jetson device
+
+## A2. Install or verify WSL 2
+
+Open **PowerShell as Administrator**:
+
+```powershell
+wsl --update
+wsl --status
+wsl --version
+wsl -l -v
+```
+
+Ubuntu must show `VERSION 2`.
+
+If WSL or Ubuntu is missing:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+Restart Windows if requested, then open Ubuntu once and create a Linux username and password.
+
+Do not run `wsl --set-version Ubuntu 2` when `wsl -l -v` already shows version `2`.
+
+## A3. Install and configure Docker Desktop
+
+Install Docker Desktop for Windows and use the WSL 2 backend.
+
+In Docker Desktop:
+
+1. Open **Settings → General**.
+2. Enable **Use the WSL 2 based engine**.
+3. Open **Settings → Resources → WSL Integration**.
+4. Enable the Ubuntu distribution.
+5. Select **Apply & restart**.
+6. Wait until Docker reports that the engine is running.
+
+Verify from PowerShell:
+
+```powershell
+docker version
+docker compose version
+docker run --rm hello-world
+```
+
+Verify from Ubuntu WSL:
+
+```bash
+docker version
+docker compose version
+docker run --rm hello-world
+```
+
+Do not install Ubuntu's `docker.io` package while using Docker Desktop WSL integration. Two competing Docker installations create unnecessary daemon, socket, and PATH problems.
+
+## A4. Install Git
+
+Inside Ubuntu WSL:
+
+```bash
+sudo apt update
+sudo apt install -y git curl
+git --version
+```
+
+Git for Windows also works when the repository is managed from PowerShell.
+
+## A5. Clone the repository
+
+### Recommended: WSL filesystem
+
+```bash
+mkdir -p ~/projects
+cd ~/projects
+
+git clone https://github.com/Marawan-Y/nextex-PoC.git
+cd nextex-PoC
+```
+
+The WSL filesystem normally performs better for Linux builds than a checkout under `/mnt/c`.
+
+### Alternative: Windows filesystem
+
+```powershell
+Set-Location "C:\path\to\parent-folder"
+git clone https://github.com/Marawan-Y/nextex-PoC.git
+Set-Location ".\nextex-PoC"
+```
+
+A Windows checkout works, including paths containing spaces, when the full path is quoted.
+
+## A6. Validate the Cloud API addresses
+
+The Edge Simulator needs two Cloud API addresses:
+
+```yaml
+CLOUD_API_BASE: http://cloud-api:8001
+CLOUD_API_PUBLIC_BASE: http://localhost:8001
+```
+
+| Variable | Used by | Correct Docker value |
+|---|---|---|
+| `CLOUD_API_BASE` | Edge container posting events to the Cloud API container | `http://cloud-api:8001` |
+| `CLOUD_API_PUBLIC_BASE` | Browser dashboard polling through the Windows host | `http://localhost:8001` |
+
+The browser cannot resolve the Docker-only hostname `cloud-api`.
+
+Validate Compose:
+
+```powershell
+docker compose config | Select-String "CLOUD_API"
+```
+
+Expected:
+
+```text
+CLOUD_API_BASE: http://cloud-api:8001
+CLOUD_API_PUBLIC_BASE: http://localhost:8001
+```
+
+When running, validate `/config`:
+
+```powershell
+Invoke-RestMethod http://localhost:8002/config | ConvertTo-Json
+```
+
+Expected field:
+
+```json
+"cloud_api_base": "http://localhost:8001"
+```
+
+## A7. First build and startup
+
+From the repository root:
+
+```powershell
+docker compose config
 docker compose up --build
 ```
 
-Then open:
-- **Monitoring UI**: http://localhost:8002
-- **Cloud API docs (Swagger)**: http://localhost:8001/docs
-- **Cloud health**: http://localhost:8001/health
-- **Cloud metrics**: http://localhost:8001/metrics
+The first build can take several minutes because Docker downloads images and Python packages.
 
-First boot takes a few seconds while Postgres/Redis become healthy and the consumer creates its consumer group. The UI will show "disconnected" for a moment, then start streaming.
+A successful startup includes:
 
----
+- PostgreSQL becomes healthy.
+- Redis becomes healthy.
+- Mosquitto accepts the Edge Simulator MQTT connection.
+- Cloud API starts on port `8001`.
+- Cloud Consumer joins the Redis consumer group.
+- Edge Simulator starts on port `8002`.
 
-## 1. What this is
+Open:
 
-Two cooperating systems, matching the two parts of the assignment:
-
-| Part | Service(s) | Role |
-|---|---|---|
-| **1. Cloud side** | `cloud-api`, `cloud-consumer`, `redis`, `postgres` | Receives `new_anomaly_class` and `threshold_exceeded` events, queues them, persists them, exposes health/metrics |
-| **2. Edge + UI** | `edge-simulator`, `mosquitto` | Simulates a Jetson device streaming frames, runs mocked detection, emits events to the cloud, publishes telemetry, serves the monitoring UI |
-
-See `diagrams/architecture.png` for the full data-flow diagram and `diagrams/event_sequence.png` for a single event's lifecycle from frame capture to persisted metric.
-
----
-
-## 2. Architecture
-
-![architecture](diagrams/architecture.png)
-
-**Why a separate `cloud-api` and `cloud-consumer` process, not one service?**
-This is the central design decision of Part 1, so it's worth stating explicitly rather than leaving it implicit in the code: ingestion throughput and processing throughput are decoupled on purpose. If Postgres slows down or the consumer briefly falls behind, `cloud-api` keeps accepting events at full speed — the *queue backlog* grows (visible immediately in `/metrics`), but Jetson devices never see elevated latency or rejected requests. A single combined process would couple those two concerns together, which is exactly the failure mode a queue is supposed to prevent.
-
-**Why the local outbox / hybrid telemetry pattern on the edge side?**
-Factory networks drop. Every network hop in this system (event POSTs to the cloud, telemetry publishes to MQTT) is therefore "local-buffer-first, network-second": write it durably where it's produced, then best-effort push it out, with a background retry loop that drains the backlog once connectivity returns. See `docs/DESIGN_NOTES.md` for the full reasoning, especially around the disk-vs-MQTT choice for telemetry specifically.
-
----
-
-## 3. Part 1 — Cloud queue/consumer service
-
-### 3.1 Why Redis Streams (vs RabbitMQ / SQS-LocalStack / Kafka)
-
-| Option | Verdict | Reasoning |
-|---|---|---|
-| **Redis Streams (chosen)** | Best fit | One extra container (Redis is likely already useful elsewhere — caching, rate limiting). Consumer groups give at-least-once delivery, XPENDING/XAUTOCLAIM give backlog + stale-consumer recovery for free, XLEN gives an O(1) queue-depth read for /metrics. Minimal ops overhead — the right trade-off for a pre-MVP, small-team startup context. |
-| RabbitMQ | Reasonable, more ops | Powerful routing (exchanges/bindings) this use case doesn't need yet. A second distinct system to run, monitor, and reason about, for capability we're not using. Would reconsider if we needed complex routing (e.g. priority queues per factory) later. |
-| SQS via LocalStack | Weakest fit for this exercise | LocalStack SQS is a simulation of a specific cloud vendor's API; it doesn't give you anything extra locally and the assignment explicitly says no cloud infra is required. |
-| Kafka | Overkill | Built for a different scale/durability profile (long retention, many independent consumer groups replaying history). Postgres is the system of record here, not the stream — we don't need log replay semantics. |
-
-### 3.2 Event types & endpoints
-
-Two distinct Pydantic models, not one generic "event" blob (see `cloud_common/schemas.py`) — they have different required fields (a frame is *mandatory* for `new_anomaly_class`, *optional and omitted by default* for `threshold_exceeded`) and different purposes (retraining data vs. low-latency alarms).
-
-```
-POST /events/new-anomaly-class     — frame required, feeds retraining
-POST /events/threshold-exceeded    — frame optional, feeds alarms
-GET  /health                       — liveness + dependency checks (Redis, Postgres)
-GET  /metrics                      — see below
-GET  /events/recent?limit=20       — convenience endpoint for the UI's event feed
+```text
+http://localhost:8002
 ```
 
-### 3.3 Metrics endpoint
+The dashboard may show `disconnected` briefly during initialization.
 
-`GET /metrics` returns, beyond what the assignment explicitly asked for:
+## A8. First-run validation
+
+Open a second PowerShell window in the repository.
+
+```powershell
+docker compose ps
+```
+
+Health:
+
+```powershell
+Invoke-RestMethod http://localhost:8001/health | ConvertTo-Json
+```
+
+Expected structure:
 
 ```json
 {
-  "total_processed_events": 142,
-  "queue_backlog": 3,
-  "queue_pending_unacked": 1,
-  "event_distribution_by_type": {"threshold_exceeded": 98, "new_anomaly_class": 44},
-  "event_distribution_by_anomaly_class": {"needle_line": 51, "oil_stain": 30},
-  "event_distribution_by_factory": {"terrot-de-01": 142},
-  "events_last_5min": 40,
-  "events_per_minute_last_5min": 8.0,
-  "last_event_at": "2026-07-11T00:12:03.221Z",
-  "seconds_since_last_event": 4.2
+  "status": "ok",
+  "redis": "ok",
+  "postgres": "ok"
 }
 ```
 
-`queue_backlog` (XLEN) and `queue_pending_unacked` (XPENDING) are reported separately on purpose: backlog is "everything ever queued," pending is "in-flight right now, not yet acknowledged" — a growing `queue_pending_unacked` with a flat `queue_backlog` means a consumer is stuck, a different failure mode than ingestion simply outrunning processing.
+Configuration:
 
-`seconds_since_last_event` was added because it's usually the first thing an on-call person actually looks at — a pipeline can report zero errors while being completely stalled, and a cumulative total count won't show that.
-
-### 3.4 Persistence
-
-Single Postgres `events` table (`cloud_common/db.py`) with both event types sharing nullable type-specific columns (`threshold_used`, `frame_path`) rather than two separate tables or a schemaless JSONB blob — both event types share the overwhelming majority of fields and query patterns, so one table with clear columns is the right level of structure at this scale. Frames are written to a disk volume (`frame_storage`) as a stand-in for object storage (S3/GCS/Blob) — the event row stores the path, not the bytes, exactly as it would with a real object store and a pre-signed URL.
-
-### 3.5 Reliability behavior (tested, not just claimed)
-
-- If `cloud-consumer` is down or crashes mid-batch, events accepted by `cloud-api` sit safely in the Redis stream (`queue_backlog` rises).
-- Entries delivered to a consumer but not acked within `PENDING_CLAIM_IDLE_MS` (default 60s) are reclaimed via XAUTOCLAIM and retried automatically — no message is silently dropped by a crashed consumer.
-- A DB insert failure for one event does not ack that event; it is retried on the next reclaim pass rather than lost.
-- Scaling: `docker compose up --scale cloud-consumer=3` adds more consumers; Redis consumer groups partition delivery across them automatically with no other code change.
-
----
-
-## 4. Part 2 — Jetson simulation + monitoring UI
-
-### 4.1 Dataset
-
-The assignment suggests a public Kaggle fabric/textile defect dataset. This repo does not vendor one directly — pulling from Kaggle requires authenticated API credentials, and shipping a third party's dataset inside a take-home repo isn't good practice regardless. Instead (`edge_simulator/dataset.py`):
-
-1. If real images exist at `edge_simulator/data/fabric_images/`, they're used (label = parent folder name).
-2. Otherwise, a deterministic synthetic fabric-defect generator produces frames on the fly — periodic knit texture + injected defects (needle line, horizontal distortion, oil stain, stitch irregularity, hole), so the entire system runs end-to-end with zero setup.
-
-See `docs/DATASET.md` for the exact `kaggle datasets download` command to drop a real dataset in — no code changes needed, just populate the folder and restart.
-
-### 4.2 Mocked detection
-
-`edge_simulator/mock_detector.py` doesn't just return random noise — it simulates plausible model behavior (high-confidence correct classification most of the time, occasional low-confidence false positives on clean frames, occasional misclassification on genuine defects) so the demo's alert/new-class logic is exercised against a realistic confidence trace rather than either a perfect oracle or pure noise.
-
-### 4.3 Event-emission rules
-
-Implemented exactly as specified, plus one addition flagged below:
-
-- New anomaly class detected -> `POST /events/new-anomaly-class` (frame attached)
-- Confidence > threshold (default 0.85, configurable via `ALARM_THRESHOLD`) -> `POST /events/threshold-exceeded`
-
-**Addition — cooldown on "new class" events (`NEW_CLASS_COOLDOWN_SECONDS`, default 120s):** without this, a machine with a persistent, ongoing defect would fire a "new class" event on every single frame, which defeats the purpose of that event type (it exists to feed retraining with fresh examples, not to duplicate the alarm stream at full frame rate). This is exactly the kind of "requirement I'd modify and explain why" the assignment invites — happy to discuss trade-offs (shorter/longer cooldown, per-class cooldowns) in the follow-up interview.
-
-### 4.4 Monitoring UI
-
-Single-page app (`edge_simulator/static/index.html`, vanilla JS, no build step) showing:
-- Live camera feed over WebSocket (`/ws/camera-feed`), frame-by-frame
-- Detection overlay (class + confidence) on each frame
-- A pulsing red border + banner when the alarm threshold is exceeded
-- Edge-device stats (frames streamed, events sent/buffered, outbox depth)
-- Cloud ingestion health/metrics panel — polls `cloud-api`'s `/health` and `/metrics` directly (the endpoints built in Part 1), including live bar charts of event distribution by type and by anomaly class
-
-### 4.5 Telemetry: local disk vs MQTT — the choice made, briefly
-
-Chosen: hybrid — local disk first, MQTT second (store-and-forward). Full reasoning in `docs/DESIGN_NOTES.md`; short version: MQTT is the right transport for telemetry (lightweight pub/sub, standard for IIoT, lets any interested subscriber consume live data), but treating it as the only copy means a broker/network outage silently drops telemetry. Every point is durably appended to a local JSONL buffer first; a background thread publishes to MQTT and retries anything unconfirmed. This is implemented, not just described — see `edge_simulator/telemetry.py`.
-
----
-
-## 5. Repository structure
-
+```powershell
+Invoke-RestMethod http://localhost:8002/config | ConvertTo-Json
 ```
+
+Metrics:
+
+```powershell
+Invoke-RestMethod http://localhost:8001/metrics | ConvertTo-Json -Depth 5
+```
+
+Recent events:
+
+```powershell
+Invoke-RestMethod "http://localhost:8001/events/recent?limit=20" |
+    ConvertTo-Json -Depth 5
+```
+
+Keep the dashboard open for several seconds. The WebSocket connection drives frame processing, and defects are intentionally less frequent than normal frames.
+
+---
+
+# Running after the initial setup
+
+Do not rebuild on every launch.
+
+## Normal startup
+
+1. Start Docker Desktop.
+2. Wait until the Docker engine is running.
+3. Open PowerShell.
+4. Move to the repository.
+5. Start all services in detached mode.
+
+```powershell
+Set-Location "C:\path\to\nextex-PoC"
+
+docker compose up -d
+Start-Sleep -Seconds 10
+docker compose ps
+```
+
+Health check:
+
+```powershell
+Invoke-RestMethod http://localhost:8001/health | ConvertTo-Json
+```
+
+Open the dashboard:
+
+```powershell
+Start-Process "http://localhost:8002"
+```
+
+## Normal shutdown
+
+```powershell
+docker compose down
+```
+
+This preserves PostgreSQL data, Redis data, frames, and Docker images.
+
+Do not add `-v` during normal shutdown.
+
+## Restart without rebuilding
+
+```powershell
+docker compose restart
+```
+
+Restart one service:
+
+```powershell
+docker compose restart edge-simulator
+```
+
+## Start after code or configuration changes
+
+```powershell
+docker compose down
+docker compose up -d --build
+```
+
+## Force a fresh build
+
+```powershell
+docker compose down --remove-orphans
+docker compose build --no-cache
+docker compose up -d --force-recreate
+```
+
+Use this only when a normal rebuild does not pick up a confirmed source change.
+
+---
+
+# Meeting and demo runbook
+
+Run the project once before the meeting. Do not make untested changes immediately before presenting.
+
+## One-minute startup
+
+```powershell
+Set-Location "C:\path\to\nextex-PoC"
+
+docker compose up -d
+Start-Sleep -Seconds 10
+
+docker compose ps
+
+Invoke-RestMethod http://localhost:8001/health |
+    ConvertTo-Json
+
+Invoke-RestMethod http://localhost:8002/config |
+    ConvertTo-Json
+
+Start-Process "http://localhost:8002"
+Start-Process "http://localhost:8001/docs"
+Start-Process "http://localhost:8001/metrics"
+```
+
+Confirm:
+
+- all six services are running,
+- PostgreSQL and Redis are healthy,
+- Cloud health is `ok`,
+- `/config` returns `http://localhost:8001`,
+- the camera feed is moving,
+- event counters begin changing.
+
+## Suggested presentation order
+
+1. Dashboard: `http://localhost:8002`
+2. Metrics: `http://localhost:8001/metrics`
+3. Persisted events: `http://localhost:8001/events/recent?limit=20`
+4. API documentation: `http://localhost:8001/docs`
+5. Explain Redis Streams, the independent consumer, and local buffering.
+
+## Optional `start-demo.ps1`
+
+Create this file in the repository root:
+
+```powershell
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
+
+Write-Host "Checking Docker..." -ForegroundColor Cyan
+
+docker info | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Docker is unavailable. Start Docker Desktop and retry." `
+        -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "Starting NexTex services..." -ForegroundColor Cyan
+docker compose up -d
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Docker Compose failed." -ForegroundColor Red
+    exit 1
+}
+
+$deadline = (Get-Date).AddSeconds(60)
+$health = $null
+
+while ((Get-Date) -lt $deadline) {
+    try {
+        $health = Invoke-RestMethod `
+            -Uri "http://localhost:8001/health" `
+            -TimeoutSec 5
+
+        if ($health.status -eq "ok") {
+            break
+        }
+    }
+    catch {
+        Start-Sleep -Seconds 2
+    }
+}
+
+docker compose ps
+
+if ($null -eq $health -or $health.status -ne "ok") {
+    Write-Host "Cloud API did not become healthy." -ForegroundColor Red
+    docker compose logs --tail=100 cloud-api postgres redis
+    exit 1
+}
+
+$config = Invoke-RestMethod `
+    -Uri "http://localhost:8002/config" `
+    -TimeoutSec 10
+
+if ($config.cloud_api_base -ne "http://localhost:8001") {
+    Write-Host "Incorrect public Cloud API URL: $($config.cloud_api_base)" `
+        -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "NexTex is healthy. Opening demo pages..." `
+    -ForegroundColor Green
+
+Start-Process "http://localhost:8002"
+Start-Process "http://localhost:8001/docs"
+Start-Process "http://localhost:8001/metrics"
+```
+
+Run:
+
+```powershell
+.\start-demo.ps1
+```
+
+If PowerShell blocks local scripts:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+## Optional `stop-demo.ps1`
+
+```powershell
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
+
+docker compose down
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Shutdown returned an error." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "NexTex stopped. Persistent data was preserved." `
+    -ForegroundColor Green
+```
+
+---
+
+# Approach B — Manual setup in Ubuntu WSL
+
+Manual mode is useful for debugging individual services and understanding each dependency. It is less convenient than Docker.
+
+Run all manual-mode components inside the same Ubuntu WSL distribution. Do not casually mix Windows Python, WSL services, and unrelated Windows database services.
+
+## B1. Install system packages
+
+```bash
+sudo apt update
+
+sudo apt install -y \
+  git \
+  curl \
+  build-essential \
+  libpq-dev \
+  postgresql \
+  postgresql-contrib \
+  redis-server \
+  mosquitto \
+  mosquitto-clients
+```
+
+## B2. Use Python 3.12
+
+The Docker images use Python 3.12. Manual mode should match it because the project pins binary packages.
+
+Install `uv`:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source ~/.bashrc
+uv --version
+```
+
+Install Python 3.12:
+
+```bash
+uv python install 3.12
+uv python list
+```
+
+Clone the repository if required:
+
+```bash
+mkdir -p ~/projects
+cd ~/projects
+
+git clone https://github.com/Marawan-Y/nextex-PoC.git
+cd nextex-PoC
+```
+
+Create a virtual environment:
+
+```bash
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+uv pip install \
+  -r cloud_common/requirements.txt \
+  -r edge_simulator/requirements.txt
+```
+
+Verify imports:
+
+```bash
+python -c \
+'import fastapi, redis, sqlalchemy, asyncpg, httpx, paho.mqtt.client, PIL, numpy; print("Python dependencies OK")'
+```
+
+## B3. Start PostgreSQL, Redis, and Mosquitto
+
+```bash
+sudo service postgresql start
+sudo service redis-server start
+sudo service mosquitto start
+```
+
+Check status:
+
+```bash
+sudo service postgresql status
+sudo service redis-server status
+sudo service mosquitto status
+```
+
+## B4. Configure PostgreSQL
+
+Set the expected password:
+
+```bash
+sudo -u postgres psql \
+  -c "ALTER USER postgres WITH PASSWORD 'postgres';"
+```
+
+Create the database if missing:
+
+```bash
+sudo -u postgres psql -tAc \
+  "SELECT 1 FROM pg_database WHERE datname='nextex'" |
+  grep -q 1 ||
+  sudo -u postgres createdb nextex
+```
+
+Check readiness:
+
+```bash
+pg_isready -h localhost -p 5432
+```
+
+Test credentials:
+
+```bash
+PGPASSWORD=postgres psql \
+  -h localhost \
+  -U postgres \
+  -d nextex \
+  -c "SELECT current_database();"
+```
+
+## B5. Verify Redis
+
+```bash
+redis-server --version
+redis-cli ping
+```
+
+Expected:
+
+```text
+PONG
+```
+
+Redis 6.2 or newer is required for `XAUTOCLAIM` stale-entry recovery.
+
+## B6. Verify Mosquitto
+
+Terminal 1:
+
+```bash
+mosquitto_sub -h localhost -t nextex/test -C 1
+```
+
+Terminal 2:
+
+```bash
+mosquitto_pub -h localhost -t nextex/test -m "mqtt-ok"
+```
+
+Terminal 1 should print `mqtt-ok`.
+
+## B7. Create manual configuration
+
+```bash
+mkdir -p .runtime/frames
+```
+
+Create `.env.manual`:
+
+```bash
+cat > .env.manual <<'ENVEOF'
+export REDIS_URL="redis://localhost:6379/0"
+export DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/nextex"
+export FRAME_STORAGE_DIR="$PWD/.runtime/frames"
+
+export STREAM_NAME="nextex:events"
+export CONSUMER_GROUP="nextex-consumers"
+export CONSUMER_NAME="consumer-1"
+export STREAM_MAXLEN="100000"
+export BLOCK_MS="5000"
+export BATCH_SIZE="10"
+export PENDING_CLAIM_IDLE_MS="60000"
+
+export DEVICE_ID="jetson-terrot-de-01-m03"
+export MACHINE_ID="M03"
+export FACTORY_ID="terrot-de-01"
+
+export CLOUD_API_BASE="http://localhost:8001"
+export CLOUD_API_PUBLIC_BASE="http://localhost:8001"
+
+export MQTT_HOST="localhost"
+export MQTT_PORT="1883"
+
+export ALARM_THRESHOLD="0.85"
+export STREAM_FPS="3.0"
+export NEW_CLASS_COOLDOWN_SECONDS="120"
+ENVEOF
+```
+
+Load this in every application terminal:
+
+```bash
+source .venv/bin/activate
+source .env.manual
+```
+
+The `FRAME_STORAGE_DIR` override avoids permission problems with the default `/data/frames` path.
+
+## B8. Start the Cloud API
+
+Terminal 1:
+
+```bash
+cd ~/projects/nextex-PoC
+source .venv/bin/activate
+source .env.manual
+
+uvicorn cloud_api.main:app \
+  --host 0.0.0.0 \
+  --port 8001
+```
+
+## B9. Start the Cloud Consumer
+
+Terminal 2:
+
+```bash
+cd ~/projects/nextex-PoC
+source .venv/bin/activate
+source .env.manual
+
+python cloud_consumer/worker.py
+```
+
+## B10. Start the Edge Simulator
+
+Terminal 3:
+
+```bash
+cd ~/projects/nextex-PoC
+source .venv/bin/activate
+source .env.manual
+
+uvicorn edge_simulator.main:app \
+  --host 0.0.0.0 \
+  --port 8002
+```
+
+Open `http://localhost:8002`.
+
+## B11. Validate manual mode
+
+```bash
+curl http://localhost:8001/health
+curl http://localhost:8002/config
+curl http://localhost:8001/metrics
+curl "http://localhost:8001/events/recent?limit=20"
+```
+
+`/config` must contain:
+
+```json
+"cloud_api_base": "http://localhost:8001"
+```
+
+## B12. Stop manual mode
+
+Stop the Python processes with `Ctrl+C`.
+
+Optionally stop infrastructure:
+
+```bash
+sudo service mosquitto stop
+sudo service redis-server stop
+sudo service postgresql stop
+```
+
+---
+
+# Dataset options
+
+No external dataset is required.
+
+The simulator checks:
+
+```text
+edge_simulator/data/fabric_images/
+```
+
+If the directory contains no images, synthetic frames are generated.
+
+To use real labeled images:
+
+```text
+edge_simulator/data/fabric_images/
+├── no_defect/
+├── needle_line/
+├── horizontal_distortion/
+├── oil_stain/
+├── stitch_irregularity/
+└── hole/
+```
+
+The parent directory becomes the ground-truth class.
+
+Supported extensions:
+
+- `.jpg`
+- `.jpeg`
+- `.png`
+- `.bmp`
+
+After adding images under the mounted data directory:
+
+```powershell
+docker compose restart edge-simulator
+```
+
+See `docs/DATASET.md` for more details.
+
+---
+
+# Environment variables
+
+## Cloud services
+
+| Variable | Default outside Docker | Docker value | Purpose |
+|---|---|---|---|
+| `REDIS_URL` | `redis://localhost:6379/0` | `redis://redis:6379/0` | Redis connection |
+| `STREAM_NAME` | `nextex:events` | same | Redis stream |
+| `CONSUMER_GROUP` | `nextex-consumers` | same | Consumer group |
+| `STREAM_MAXLEN` | `100000` | same | Approximate stream retention |
+| `DATABASE_URL` | PostgreSQL on localhost | PostgreSQL container URL | SQLAlchemy connection |
+| `FRAME_STORAGE_DIR` | `/data/frames` | `/data/frames` volume | Saved event frames |
+| `CONSUMER_NAME` | `consumer-1` | same | Consumer identity |
+| `BLOCK_MS` | `5000` | same | Blocking read duration |
+| `BATCH_SIZE` | `10` | same | Events per batch |
+| `PENDING_CLAIM_IDLE_MS` | `60000` | same | Stale-message reclaim threshold |
+
+## Edge Simulator
+
+| Variable | Default outside Docker | Docker value | Purpose |
+|---|---|---|---|
+| `DEVICE_ID` | `jetson-terrot-de-01-m03` | same | Device identifier |
+| `MACHINE_ID` | `M03` | same | Machine identifier |
+| `FACTORY_ID` | `terrot-de-01` | same | Factory identifier |
+| `CLOUD_API_BASE` | `http://localhost:8001` | `http://cloud-api:8001` | Internal event POST target |
+| `CLOUD_API_PUBLIC_BASE` | `http://localhost:8001` | same | Browser polling target |
+| `MQTT_HOST` | `localhost` | `mosquitto` | MQTT broker |
+| `MQTT_PORT` | `1883` | same | MQTT port |
+| `ALARM_THRESHOLD` | `0.85` | same | Alarm threshold |
+| `STREAM_FPS` | `2.0` in Python | `3.0` in Compose | Browser stream rate |
+| `NEW_CLASS_COOLDOWN_SECONDS` | `120` | same | New-class deduplication window |
+
+---
+
+# Development workflow
+
+## Check changes
+
+```powershell
+git status
+git diff
+```
+
+## Validate Python syntax
+
+```powershell
+python -m py_compile .\edge_simulator\main.py
+python -m py_compile .\cloud_api\main.py
+python -m py_compile .\cloud_consumer\worker.py
+```
+
+## Rebuild one service
+
+```powershell
+docker compose up -d --build edge-simulator
+docker compose up -d --build cloud-api
+docker compose up -d --build cloud-consumer
+```
+
+## Rebuild everything
+
+```powershell
+docker compose up -d --build
+```
+
+## Inspect running container code
+
+```powershell
+docker compose exec edge-simulator sh -lc `
+  "grep -n 'CLOUD_API' /app/edge_simulator/main.py"
+```
+
+Inspect environment variables:
+
+```powershell
+docker compose exec edge-simulator sh -lc `
+  "env | grep CLOUD_API"
+```
+
+## Commit tested changes
+
+```powershell
+git status
+git add .
+git commit -m "Describe the change"
+git push
+```
+
+Test the built containers before committing. A host source file can be correct while an old running image still contains previous code.
+
+---
+
+# Logs and diagnostics
+
+## Container status
+
+```powershell
+docker compose ps
+```
+
+## All logs
+
+```powershell
+docker compose logs -f --tail=100
+```
+
+## Individual logs
+
+```powershell
+docker compose logs -f --tail=100 edge-simulator
+docker compose logs -f --tail=100 cloud-api
+docker compose logs -f --tail=100 cloud-consumer
+docker compose logs -f --tail=100 postgres
+docker compose logs -f --tail=100 redis
+docker compose logs -f --tail=100 mosquitto
+```
+
+## Metrics
+
+```powershell
+Invoke-RestMethod http://localhost:8001/metrics |
+    ConvertTo-Json -Depth 5
+```
+
+Important fields:
+
+- `total_processed_events`
+- `queue_backlog`
+- `queue_pending_unacked`
+- `event_distribution_by_type`
+- `event_distribution_by_anomaly_class`
+- `event_distribution_by_factory`
+- `events_last_5min`
+- `events_per_minute_last_5min`
+- `last_event_at`
+- `seconds_since_last_event`
+
+`queue_backlog` is the Redis stream length, including retained acknowledged entries. `queue_pending_unacked` is the direct measure of delivered but unacknowledged events.
+
+## Find port owners on Windows
+
+```powershell
+Get-NetTCPConnection -LocalPort 8001 -ErrorAction SilentlyContinue
+Get-NetTCPConnection -LocalPort 8002 -ErrorAction SilentlyContinue
+Get-NetTCPConnection -LocalPort 5432 -ErrorAction SilentlyContinue
+Get-NetTCPConnection -LocalPort 6379 -ErrorAction SilentlyContinue
+Get-NetTCPConnection -LocalPort 1883 -ErrorAction SilentlyContinue
+```
+
+---
+
+# Stopping, resetting, and preserving data
+
+## Stop and preserve data
+
+```powershell
+docker compose down
+```
+
+Preserved:
+
+- `postgres_data`
+- `redis_data`
+- `frame_storage`
+- built images
+- host-mounted Edge data
+
+## Stop without removing containers
+
+```powershell
+docker compose stop
+```
+
+Resume:
+
+```powershell
+docker compose start
+```
+
+## Recreate containers while preserving volumes
+
+```powershell
+docker compose down --remove-orphans
+docker compose up -d --force-recreate
+```
+
+## Delete all persistent Docker data
+
+```powershell
+docker compose down -v --remove-orphans
+```
+
+This deletes PostgreSQL data, Redis data, and stored frames.
+
+---
+
+# Troubleshooting
+
+## `docker` is not recognized
+
+Start Docker Desktop, wait for the engine, open a new PowerShell window, and run:
+
+```powershell
+docker version
+docker compose version
+```
+
+## `/usr/bin/docker: Input/output error` in WSL
+
+PowerShell as Administrator:
+
+```powershell
+wsl --shutdown
+```
+
+Then restart Docker Desktop, verify Ubuntu is enabled under WSL Integration, reopen Ubuntu, and run:
+
+```bash
+docker version
+docker compose version
+docker run --rm hello-world
+```
+
+Do not install a second Docker daemon as a reaction to this error.
+
+## Dashboard Cloud panel says `unreachable`
+
+```powershell
+Invoke-RestMethod http://localhost:8002/config | ConvertTo-Json
+```
+
+Correct:
+
+```json
+"cloud_api_base": "http://localhost:8001"
+```
+
+Validate Compose:
+
+```powershell
+docker compose config | Select-String "CLOUD_API"
+```
+
+Expected:
+
+```text
+CLOUD_API_BASE: http://cloud-api:8001
+CLOUD_API_PUBLIC_BASE: http://localhost:8001
+```
+
+Rebuild the Edge Simulator if needed:
+
+```powershell
+docker compose down
+docker compose build --no-cache edge-simulator
+docker compose up -d --force-recreate
+```
+
+## Port is already allocated
+
+```powershell
+docker ps --format "table {{.Names}}\t{{.Ports}}"
+Get-NetTCPConnection -LocalPort 8001 -ErrorAction SilentlyContinue
+```
+
+Stop the conflicting service or change the host-side port mapping.
+
+## PostgreSQL port `5432` is occupied
+
+```powershell
+$connections = Get-NetTCPConnection -LocalPort 5432 -State Listen
+$connections | Format-Table LocalAddress, LocalPort, OwningProcess
+
+Get-Process -Id (
+    $connections.OwningProcess |
+    Select-Object -Unique
+)
+```
+
+Only one service should own the host port used by this project.
+
+## `PermissionError: /data/frames` in manual mode
+
+```bash
+source .env.manual
+echo "$FRAME_STORAGE_DIR"
+```
+
+It should point to `<repo>/.runtime/frames`.
+
+## PostgreSQL authentication failed
+
+```bash
+sudo -u postgres psql \
+  -c "ALTER USER postgres WITH PASSWORD 'postgres';"
+
+sudo service postgresql restart
+```
+
+## `ModuleNotFoundError` in manual mode
+
+```bash
+cd ~/projects/nextex-PoC
+source .venv/bin/activate
+source .env.manual
+
+uv pip install \
+  -r cloud_common/requirements.txt \
+  -r edge_simulator/requirements.txt
+```
+
+## Camera works but metrics do not change
+
+Check the Cloud Consumer and Edge logs:
+
+```powershell
+docker compose logs --tail=100 edge-simulator
+docker compose logs --tail=100 cloud-consumer
+```
+
+Defects are intentionally a minority of frames, so counters do not change on every frame.
+
+## Compose warns that `version` is obsolete
+
+Modern Docker Compose ignores:
+
+```yaml
+version: "3.9"
+```
+
+The warning is harmless. The line can be removed.
+
+## Docker runs old code after editing
+
+```powershell
+docker compose down
+docker compose up -d --build
+```
+
+Verify container code:
+
+```powershell
+docker compose exec edge-simulator sh -lc `
+  "grep -n 'CLOUD_API' /app/edge_simulator/main.py"
+```
+
+## Full emergency reset
+
+Use only when persistent data can be deleted:
+
+```powershell
+docker compose down -v --remove-orphans
+docker compose build --no-cache
+docker compose up -d --force-recreate
+```
+
+---
+
+# Repository structure
+
+```text
 .
+├── README.md
 ├── docker-compose.yml
-├── mosquitto/mosquitto.conf
-├── cloud_common/              # shared by cloud-api & cloud-consumer
-│   ├── schemas.py             # Pydantic event models
-│   ├── db.py                  # SQLAlchemy async models + queries
-│   ├── queue.py               # Redis Streams wrapper
-│   └── config.py
+├── mosquitto/
+│   └── mosquitto.conf
+├── cloud_common/
+│   ├── config.py
+│   ├── schemas.py
+│   ├── db.py
+│   ├── queue.py
+│   └── requirements.txt
 ├── cloud_api/
-│   ├── main.py                # FastAPI: ingestion + health + metrics
+│   ├── main.py
 │   └── Dockerfile
 ├── cloud_consumer/
-│   ├── worker.py               # consumer loop, retry/reclaim logic
+│   ├── worker.py
 │   └── Dockerfile
 ├── edge_simulator/
-│   ├── main.py                 # FastAPI + WebSocket streaming server
-│   ├── dataset.py              # real-or-synthetic frame source
-│   ├── mock_detector.py        # realistic mocked model output
-│   ├── telemetry.py            # hybrid disk+MQTT publisher
-│   ├── static/index.html       # monitoring UI (vanilla JS)
+│   ├── main.py
+│   ├── dataset.py
+│   ├── mock_detector.py
+│   ├── telemetry.py
+│   ├── requirements.txt
+│   ├── static/index.html
+│   ├── data/
 │   └── Dockerfile
 ├── diagrams/
-│   ├── architecture.png
-│   └── event_sequence.png
 ├── docs/
-│   ├── DESIGN_NOTES.md          # disk vs MQTT + production considerations
-│   └── DATASET.md               # how to plug in a real Kaggle dataset
 └── notebooks/
-    └── walkthrough.ipynb        # end-to-end runnable demo notebook
+    └── walkthrough.ipynb
 ```
 
 ---
 
-## 6. Environment variables (all optional, sensible defaults for docker-compose)
+# Design decisions
 
-| Variable | Service | Default | Purpose |
-|---|---|---|---|
-| `REDIS_URL` | cloud-api, cloud-consumer | redis://redis:6379/0 | Queue connection |
-| `DATABASE_URL` | cloud-api, cloud-consumer | postgresql+asyncpg://... | Persistence |
-| `FRAME_STORAGE_DIR` | cloud-api, cloud-consumer | /data/frames | Frame storage stand-in for object storage |
-| `CONSUMER_NAME` | cloud-consumer | consumer-1 | Distinguishes replicas when scaled |
-| `ALARM_THRESHOLD` | edge-simulator | 0.85 | Confidence threshold for threshold_exceeded |
-| `NEW_CLASS_COOLDOWN_SECONDS` | edge-simulator | 120 | Cooldown before re-firing new_anomaly_class for the same class |
-| `STREAM_FPS` | edge-simulator | 3.0 | Simulated camera frame rate |
-| `MQTT_HOST` / `MQTT_PORT` | edge-simulator | mosquitto / 1883 | Telemetry broker |
-| `CLOUD_API_BASE` | edge-simulator | http://cloud-api:8001 | Where to POST events |
+## Redis Streams
+
+Redis Streams provides consumer groups, at-least-once delivery, pending-entry tracking, stale-message claiming, and low operational overhead. PostgreSQL remains the system of record.
+
+## Independent Cloud Consumer
+
+If PostgreSQL becomes slow, the Cloud API can continue accepting events while Redis absorbs the backlog. Persistence failures do not take ingestion down.
+
+## Explicit event models
+
+`new_anomaly_class` and `threshold_exceeded` use separate Pydantic models because their required fields and purposes differ.
+
+## Local-buffer-first networking
+
+- Edge Cloud events are held temporarily if the Cloud API is unreachable.
+- Telemetry is appended to local JSONL before MQTT publication.
+- The Cloud API places events in Redis before persistence.
+
+## Synthetic-by-default dataset
+
+The project starts without third-party credentials or licensed data. Real data can be added without changing code.
+
+## New-class cooldown
+
+Persistent defects continue generating operator alarms but do not upload nearly identical retraining frames on every frame.
 
 ---
 
-## 7. What was tested
+# Production considerations
 
-Every component in this repo was run and exercised directly (not just written and assumed correct) during development, outside Docker (Redis/Postgres/Mosquitto installed locally in the dev sandbox, equivalent to what docker-compose provisions) — see `notebooks/walkthrough.ipynb` for a live, **already-executed** record (outputs included, not just source) of:
-- Both event types being ingested, queued, persisted, and reflected in `/metrics`
-- Two real bugs found and fixed via this exact testing loop:
-  1. A datetime-deserialization bug in the consumer (events silently stuck in `pending`, not lost — proving the retry design actually works)
-  2. A concurrent-schema-creation race between `cloud-api` and `cloud-consumer` on a cold start (both racing to `CREATE TABLE`), fixed with a retry in `init_db()`
-- A full from-scratch restart (dropped database, flushed queue) completing cleanly after both fixes
-- The WebSocket stream producing frames, mocked detections, a `new_anomaly_class` event, a cooldown correctly suppressing a duplicate, and a `threshold_exceeded` alarm
-- Telemetry points being durably written to disk and published over MQTT
+This repository is a proof of concept, not a production deployment.
 
-## 8. Where I'd take this next (production considerations)
+Production work should include:
 
-Covered in half a page in `docs/DESIGN_NOTES.md` Section 2 — short version: object storage instead of a disk volume for frames, TLS + per-device auth instead of open CORS/anonymous MQTT, Alembic migrations instead of `create_all`, structured logging + real metrics export (Prometheus) instead of a JSON endpoint, and horizontal scaling validation for the consumer under real load.
+- object storage instead of a local frame volume,
+- TLS for HTTP and MQTT,
+- authenticated devices and per-device credentials,
+- restricted CORS,
+- non-anonymous Mosquitto configuration,
+- Alembic migrations,
+- PostgreSQL row-level security for multi-tenancy,
+- structured logging and Prometheus metrics,
+- alerting on pipeline staleness and pending messages,
+- multi-device and multi-consumer load testing,
+- a real labeling and retraining pipeline,
+- a durable Edge event outbox instead of an in-memory deque,
+- MQTT PUBACK-aware delivery tracking,
+- graceful task shutdown and lifecycle management.
+
+See `docs/DESIGN_NOTES.md`.
+
+---
+
+# Official installation references
+
+- WSL: https://learn.microsoft.com/en-us/windows/wsl/install
+- Docker Desktop for Windows: https://docs.docker.com/desktop/setup/install/windows-install/
+- PostgreSQL on Ubuntu: https://www.postgresql.org/download/linux/ubuntu/
+- Eclipse Mosquitto: https://mosquitto.org/download/
+- `uv` installation: https://docs.astral.sh/uv/getting-started/installation/
+- Python installation with `uv`: https://docs.astral.sh/uv/guides/install-python/
