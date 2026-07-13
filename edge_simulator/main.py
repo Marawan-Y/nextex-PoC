@@ -45,7 +45,14 @@ log = logging.getLogger("edge-simulator")
 DEVICE_ID = os.environ.get("DEVICE_ID", "jetson-terrot-de-01-m03")
 MACHINE_ID = os.environ.get("MACHINE_ID", "M03")
 FACTORY_ID = os.environ.get("FACTORY_ID", "terrot-de-01")
-CLOUD_API_BASE = os.environ.get("CLOUD_API_BASE", "http://localhost:8001")
+CLOUD_API_BASE = os.environ.get(
+    "CLOUD_API_BASE",
+    "http://localhost:8001",
+)
+CLOUD_API_PUBLIC_BASE = os.environ.get(
+    "CLOUD_API_PUBLIC_BASE",
+    "http://localhost:8001",
+)
 MQTT_HOST = os.environ.get("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 ALARM_THRESHOLD = float(os.environ.get("ALARM_THRESHOLD", "0.85"))
@@ -186,7 +193,7 @@ async def config():
         "device_id": DEVICE_ID,
         "machine_id": MACHINE_ID,
         "factory_id": FACTORY_ID,
-        "cloud_api_base": CLOUD_API_BASE,
+        "cloud_api_base": CLOUD_API_PUBLIC_BASE,
         "alarm_threshold": ALARM_THRESHOLD,
         "stream_fps": STREAM_FPS,
         "frame_source": frame_source.source_description,

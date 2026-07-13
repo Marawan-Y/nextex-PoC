@@ -1,4 +1,4 @@
-version: "3.9"
+﻿version: "3.9"
 
 services:
   # --- Infrastructure ---
@@ -90,6 +90,7 @@ services:
       MACHINE_ID: M03
       FACTORY_ID: terrot-de-01
       CLOUD_API_BASE: http://cloud-api:8001
+      CLOUD_API_PUBLIC_BASE: http://localhost:8001
       MQTT_HOST: mosquitto
       MQTT_PORT: "1883"
       ALARM_THRESHOLD: "0.85"
@@ -105,3 +106,4 @@ volumes:
   redis_data:
   postgres_data:
   frame_storage:
+
