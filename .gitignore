@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# runtime-generated, not part of the repo
+edge_simulator/data/telemetry_buffer/*.jsonl
+edge_simulator/data/telemetry_buffer/*.offset
+edge_simulator/data/fabric_images/*
+!edge_simulator/data/fabric_images/.gitkeep
+
+.env
+*.log

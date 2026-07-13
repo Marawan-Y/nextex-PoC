@@ -1,0 +1,107 @@
+version: "3.9"
+
+services:
+  # --- Infrastructure ---
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: nextex
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  # --- Cloud side (Part 1 of the assignment) ---
+  cloud-api:
+    build:
+      context: .
+      dockerfile: cloud_api/Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nextex
+      FRAME_STORAGE_DIR: /data/frames
+    volumes:
+      - frame_storage:/data/frames
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  cloud-consumer:
+    build:
+      context: .
+      dockerfile: cloud_consumer/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nextex
+      FRAME_STORAGE_DIR: /data/frames
+      CONSUMER_NAME: consumer-1
+    volumes:
+      - frame_storage:/data/frames
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # Scale independently of cloud-api, e.g.:
+    #   docker compose up --scale cloud-consumer=3
+    # (each replica gets a distinct hostname; set CONSUMER_NAME per
+    # replica via a wrapper entrypoint if running >1 in production)
+
+  # --- Edge simulation + monitoring UI (Part 2 of the assignment) ---
+  edge-simulator:
+    build:
+      context: .
+      dockerfile: edge_simulator/Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      DEVICE_ID: jetson-terrot-de-01-m03
+      MACHINE_ID: M03
+      FACTORY_ID: terrot-de-01
+      CLOUD_API_BASE: http://cloud-api:8001
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      ALARM_THRESHOLD: "0.85"
+      STREAM_FPS: "3.0"
+      NEW_CLASS_COOLDOWN_SECONDS: "120"
+    volumes:
+      - ./edge_simulator/data:/app/edge_simulator/data
+    depends_on:
+      - cloud-api
+      - mosquitto
+
+volumes:
+  redis_data:
+  postgres_data:
+  frame_storage:
